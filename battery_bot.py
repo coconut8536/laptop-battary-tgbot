@@ -17,6 +17,7 @@ class BatteryBotData:
         self.last_battery_check_timestamp = 0
 
     def save(self):
+        # Сохраняем только при изменении данных
         try:
             with open(DATA_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self.__dict__, f, ensure_ascii=False)
@@ -38,66 +39,60 @@ async def update_battery_message(context: ContextTypes.DEFAULT_TYPE):
     bot_data = context.bot_data.setdefault('battery_data', BatteryBotData.load())
 
     now_ts = datetime.now().timestamp()
-
+    last_check = bot_data.last_battery_check_timestamp
     # Проверка выхода из сна по задержке между вызовами
-    if bot_data.last_battery_check_timestamp != 0:
-        diff = now_ts - bot_data.last_battery_check_timestamp
-        if diff > CHECK_INTERVAL * 2:
-            try:
-                await context.bot.send_message(chat_id=CHAT_ID, text="💤 Ноутбук вышел из режима сна, бот продолжает работу.")
-            except Exception:
-                pass
+    if last_check and now_ts - last_check > CHECK_INTERVAL * 2:
+        try:
+            await context.bot.send_message(chat_id=CHAT_ID, text="💤 Ноутбук вышел из режима сна, бот продолжает работу.")
+        except Exception:
+            pass
 
     bot_data.last_battery_check_timestamp = now_ts
-    bot_data.save()
 
-    try:
-        battery = psutil.sensors_battery()
-        if battery is None:
-            return
+    battery = psutil.sensors_battery()
+    if battery is None:
+        return
 
-        current_percent = battery.percent
+    current_percent = battery.percent
 
-        if current_percent < CRITICAL_LEVEL and not battery.power_plugged:
-            if not bot_data.critical_alert_sent:
-                await send_critical_alert(context, battery)
-                bot_data.critical_alert_sent = True
-                bot_data.save()
-            return
-        else:
-            if bot_data.critical_alert_sent:
-                bot_data.critical_alert_sent = False
-                bot_data.save()
-
-        should_update = (
-            bot_data.last_percent is None or
-            abs(current_percent - bot_data.last_percent) >= MIN_CHANGE_PERCENT or
-            current_percent == 100
-        )
-
-        if should_update and now_ts - bot_data.last_update_timestamp >= EDIT_COOLDOWN:
-            current_time = get_charge_time() if battery.power_plugged else None
-
-            await send_status(context, battery)
-            bot_data.last_percent = current_percent
-            bot_data.last_charge_time = current_time
-            bot_data.last_update_timestamp = now_ts
+    # Критический уровень заряда
+    if current_percent < CRITICAL_LEVEL and not battery.power_plugged:
+        if not bot_data.critical_alert_sent:
+            await send_critical_alert(context, battery)
+            bot_data.critical_alert_sent = True
             bot_data.save()
+        return
+    elif bot_data.critical_alert_sent and (current_percent >= CRITICAL_LEVEL or battery.power_plugged):
+        bot_data.critical_alert_sent = False
 
-    except Exception:
-        pass
+    should_update = (
+        bot_data.last_percent is None or
+        abs(current_percent - bot_data.last_percent) >= MIN_CHANGE_PERCENT or
+        current_percent == 100
+    )
+    if should_update and now_ts - bot_data.last_update_timestamp >= EDIT_COOLDOWN:
+        current_time = get_charge_time() if battery.power_plugged else None
+        await send_status(context, battery)
+        bot_data.last_percent = current_percent
+        bot_data.last_charge_time = current_time
+        bot_data.last_update_timestamp = now_ts
+
+    bot_data.save()
 
 async def send_status(context, battery, force=False):
     bot_data = context.bot_data['battery_data']
     status = format_battery_status(battery)
-
     try:
         if bot_data.last_message_id:
-            await context.bot.edit_message_text(
-                chat_id=CHAT_ID,
-                message_id=bot_data.last_message_id,
-                text=status
-            )
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=CHAT_ID,
+                    message_id=bot_data.last_message_id,
+                    text=status
+                )
+            except Exception:
+                msg = await context.bot.send_message(chat_id=CHAT_ID, text=status)
+                bot_data.last_message_id = msg.message_id
         else:
             msg = await context.bot.send_message(
                 chat_id=CHAT_ID,
@@ -105,14 +100,9 @@ async def send_status(context, battery, force=False):
                 disable_notification=not force
             )
             bot_data.last_message_id = msg.message_id
-            bot_data.save()
+        bot_data.save()
     except Exception:
-        try:
-            msg = await context.bot.send_message(chat_id=CHAT_ID, text=status)
-            bot_data.last_message_id = msg.message_id
-            bot_data.save()
-        except Exception:
-            pass
+        pass
 
 async def send_critical_alert(context, battery):
     text = (
@@ -165,11 +155,8 @@ def format_battery_status(battery):
     if percent < 20 and not battery.power_plugged:
         lines.append(f"⚠ Низкий заряд! {percent}%")
 
-    # Добавляем время последнего обновления
     lines.append(f"🕒 Обновлено: {datetime.now().strftime('%H:%M:%S')}")
-
     return "\n".join(lines)
-
 
 def get_charge_time():
     try:
@@ -190,36 +177,27 @@ def estimate_runtime():
 def format_time(seconds):
     hours, remainder = divmod(seconds, 3600)
     mins = remainder // 60
-    if hours > 0:
-        return f"{hours}ч {mins}мин"
-    else:
-        return f"{mins}мин"
+    return f"{hours}ч {mins}мин" if hours > 0 else f"{mins}мин"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        battery = psutil.sensors_battery()
-        if battery is None:
-            await update.message.reply_text("❌ Датчик батареи не найден")
-            return
-        await update.message.reply_text(
-            "🔋 Battery Bot - Мониторинг батареи\n"
-            "Статус будет автоматически обновляться в закреплённом сообщении\n"
-            "Текущий статус:\n" + format_battery_status(battery)
-        )
-    except Exception:
-        pass
+    battery = psutil.sensors_battery()
+    if battery is None:
+        await update.message.reply_text("❌ Датчик батареи не найден")
+        return
+    await update.message.reply_text(
+        "🔋 Battery Bot - Мониторинг батареи\n"
+        "Статус будет автоматически обновляться в закреплённом сообщении\n"
+        "Текущий статус:\n" + format_battery_status(battery)
+    )
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        battery = psutil.sensors_battery()
-        if battery is None:
-            await update.message.reply_text("❌ Датчик батареи не найден")
-            return
-        await update.message.reply_text(
-            "🔋 Текущий статус батареи:\n" + format_battery_status(battery)
-        )
-    except Exception:
-        pass
+    battery = psutil.sensors_battery()
+    if battery is None:
+        await update.message.reply_text("❌ Датчик батареи не найден")
+        return
+    await update.message.reply_text(
+        "🔋 Текущий статус батареи:\n" + format_battery_status(battery)
+    )
 
 async def notify_startup(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -231,17 +209,13 @@ def main():
     os.makedirs(os.path.dirname(DATA_FILE) or '.', exist_ok=True)
 
     app = Application.builder().token(TOKEN).build()
-
     app.bot_data['battery_data'] = BatteryBotData.load()
 
     app.job_queue.run_repeating(
         update_battery_message,
-        interval=CHECK_INTERVAL,
+        interval=CHECK_INTERVAL,   # выставляйте побольше, например 600 (10 минут)
         first=10,
-        job_kwargs={
-            'misfire_grace_time': 300,
-            'coalesce': True
-        }
+        job_kwargs={'misfire_grace_time': 300, 'coalesce': True}
     )
 
     app.job_queue.run_once(notify_startup, when=1)
@@ -250,7 +224,6 @@ def main():
     app.add_handler(CommandHandler("status", status_command))
 
     print("🟢 Бот успешно запущен и работает.")
-
     app.run_polling()
 
 if __name__ == "__main__":
