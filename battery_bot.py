@@ -165,7 +165,11 @@ def format_battery_status(battery):
     if percent < 20 and not battery.power_plugged:
         lines.append(f"⚠ Низкий заряд! {percent}%")
 
+    # Добавляем время последнего обновления
+    lines.append(f"🕒 Обновлено: {datetime.now().strftime('%H:%M:%S')}")
+
     return "\n".join(lines)
+
 
 def get_charge_time():
     try:
